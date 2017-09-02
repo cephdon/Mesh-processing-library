@@ -525,6 +525,7 @@ void HW::end_hwkey() {
 
 void HW::handle_key(int why_called, WPARAM key_data) {
     string s;
+    // SHOW(why_called, why_called==WM_KEYDOWN, int(key_data));
     if (why_called==WM_KEYDOWN) {
         int virt_key = int(key_data);
         if (virt_key>=VK_F1 && virt_key<=VK_F12) {
@@ -542,7 +543,13 @@ void HW::handle_key(int why_called, WPARAM key_data) {
              bcase VK_INSERT:   s = "<insert>";
              bcase VK_DELETE:   s = "<delete>";
              bdefault:
-                return;             // we don't care about this key, or it will be handled later (by WM_CHAR)
+                if (get_key_modifier(EModifier::control) && virt_key>='0' && virt_key<='9') {
+                    // control-numbers (C-0 .. C-9) do not produce any subsequent WM_CHAR message, so handle now.
+                    char ch = assert_narrow_cast<char>(virt_key);
+                    s = ch;
+                } else {
+                    return;     // we don't care about this key, or it will be handled later (by WM_CHAR)
+                }
             }
         }
     } else {
@@ -1259,6 +1266,108 @@ void HW::ogl_create_window(const Vec2<int>& yxpos) {
         int val = _multisample==3 || _multisample==5 ? GL_NICEST : GL_FASTEST;
         glHint(GL_MULTISAMPLE_FILTER_HINT_NV, val);
     }
+}
+
+// Clipboard
+//  debug using ~/bin/sys/FreeClipViewer.exe
+
+namespace {
+
+struct bmp_BITMAPINFOHEADER {   // size 40
+    uint32_t biSize;
+    int biWidth;
+    int biHeight;
+    ushort biPlanes;
+    ushort biBitCount;
+    uint32_t biCompression;
+    uint32_t biSizeImage;
+    int biXPelsPerMeter;
+    int biYPelsPerMeter;
+    uint32_t biClrUsed;
+    uint32_t biClrImportant;
+};
+
+}
+
+bool HW::copy_image_to_clipboard(const Image& image) {
+    if (!assertw(image.size())) return false;
+    int ncomp = image.zsize()==4 ? 4 : 3;
+    int rowsize = image.xsize()*ncomp; while ((rowsize&3)!=0) rowsize++;
+    int size = sizeof(bmp_BITMAPINFOHEADER)+rowsize*image.ysize();
+    HANDLE hGlobal = assertx(GlobalAlloc(GHND | GMEM_SHARE, size));
+    {
+        uchar* buf = static_cast<uchar*>(assertx(GlobalLock(hGlobal))); {
+            bmp_BITMAPINFOHEADER bmih; static_assert(sizeof(bmih)==40, "");
+            std::memset(&bmih, 0, sizeof(bmih));
+            bmih.biSize = sizeof(bmih);
+            bmih.biWidth = image.xsize();
+            bmih.biHeight = image.ysize();
+            bmih.biPlanes = 1;
+            bmih.biBitCount = narrow_cast<ushort>(ncomp*8);
+            bmih.biCompression = 0;
+            bmih.biSizeImage = rowsize*image.ysize();
+            *reinterpret_cast<bmp_BITMAPINFOHEADER*>(buf) = bmih;
+            uchar* p = buf+sizeof(bmih);
+            for_int(y, image.ysize()) {
+                int yy = image.ysize()-1-y; // because bmp has image origin at lower-left
+                for_int(x, image.xsize()) {
+                    const Pixel& pix = image[yy][x];
+                    *p++ = pix[2]; *p++ = pix[1]; *p++ = pix[0]; // RGBA to BGRA
+                    if (ncomp==4) *p++ = pix[3];
+                }
+                while (uintptr_t(p)&3) *p++ = uchar(0);
+            }
+            assertx(int(p-buf)==size);
+        } assertx(!GlobalUnlock(hGlobal));
+    }
+    bool ok = true;
+    unsigned enc_format = CF_DIB;
+    assertx(OpenClipboard(nullptr)); { // no window handle, but OK.
+        assertx(EmptyClipboard());
+        if (!assertw(SetClipboardData(enc_format, hGlobal))) ok = false; // data may be too big
+    } assertx(CloseClipboard());
+    // Note: should not call GlobalFree(hGlobal) since ownership has been transferred to system.
+    return ok;
+}
+
+bool HW::copy_clipboard_to_image(Image& image) {
+    if (IsClipboardFormatAvailable(CF_BITMAP)) {
+        Warning("ignoring CF_BITMAP for now");
+    }
+    if (IsClipboardFormatAvailable(CF_DIB)) {
+        if (!assertw(OpenClipboard(nullptr))) return false;
+        HANDLE hGlobal = assertx(GetClipboardData(CF_DIB));
+        size_t size = assertx(GlobalSize(hGlobal));
+        assertx(size>=sizeof(bmp_BITMAPINFOHEADER));
+        {
+            uchar* buf = static_cast<uchar*>(assertx(GlobalLock(hGlobal))); {
+                bmp_BITMAPINFOHEADER& bmih = *reinterpret_cast<bmp_BITMAPINFOHEADER*>(buf);
+                assertx(bmih.biSize==40);
+                image.init(V(bmih.biHeight, bmih.biWidth));
+                assertx(bmih.biBitCount==8 || bmih.biBitCount==24 || bmih.biBitCount==32);
+                const int ncomp = bmih.biBitCount/8;
+                image.set_zsize(ncomp);
+                uchar* p = buf+bmih.biSize;
+                for_int(y, image.ysize()) {
+                    int yy = image.ysize()-1-y; // flip vertically
+                    for_int(x, image.xsize()) {
+                        Pixel& pix = image[yy][x];
+                        pix[2] = *p++; pix[1] = *p++; pix[0] = *p++; // BGRA to RGBA
+                        if (ncomp==4) pix[3] = *p++;
+                        else pix[3] = 255;
+                    }
+                    while (uintptr_t(p)&3) p++;
+                }
+                if (0) SHOW(size, p-buf, image.dims(), bmih.biBitCount, image.zsize());
+                // e.g. fails with size=837180 p-buf=837168 image.dims()=[389, 538] bmih.biBitCount=32 image.zsize()=4
+                if (0) assertx(size_t(p-buf)==size);
+                if (1) assertw(abs((p-buf)-ptrdiff_t(size))<32);
+            } GlobalUnlock(hGlobal); // decrement reference count; nonzero because still owned by clipboard
+        }
+        assertx(CloseClipboard());
+        return true;
+    }
+    return false;
 }
 
 } // namespace hh

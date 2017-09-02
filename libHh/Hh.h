@@ -186,7 +186,7 @@ template<typename T> T log2(T v) { return std::log(v)/std::log(T(2)); }
 } // namespace std
 #endif
 
-#if defined(__CYGWIN__) && !defined(HH_NO_DEFINE_STD_HYPOT)
+#if defined(__CYGWIN__) && __GNUC__*100+__GNUC_MINOR__<500 && !defined(HH_NO_DEFINE_STD_HYPOT)
 namespace std {                 // missing hypot() functions
 inline float hypot(float a, float b) { return hypotf(a, b); }
 inline double hypot(double a, double b) { return ::hypot(a, b); }
@@ -196,6 +196,8 @@ inline double hypot(double a, double b) { return ::hypot(a, b); }
 #if defined(__clang__) && defined(__GNUC__) && __GNUC__*100+__GNUC_MINOR__<408 && !defined(HH_NO_DEFINE_STD_ONCE)
 namespace std {                 // workaround for current mingw32 4.7.2
 struct once_flag { int done{0}; };
+// If there is a compilation error here, e.g. "reference to 'once_flag' is ambiguous",
+//  use "make HH_NO_DEFINE_STD_ONCE=1".
 template<typename Callable, typename... Args> void call_once(std::once_flag& flag, Callable&& func, Args&&... args) {
     if (!flag.done++) func(std::forward<Args>(args)...);
 }

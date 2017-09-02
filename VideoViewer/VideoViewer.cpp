@@ -54,7 +54,7 @@ using namespace hh;
 namespace {
 
 const bool k_prefer_nv12 = 1;   // read videos using NV12 format (if even dimensions) to save memory and improve speed
-const bool k_use_bgr = 1;       // read images using BGR (rather than RGB) channel order to improve speed
+const bool k_use_bgra = 1;      // read images using BGRA (rather than RGBA) channel order to improve speed
 const Pixel k_background_color = Pixel::black();
 const Array<double> k_speeds = { // video playback speed factors
     0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,  1.,  1.1, 1.2, 1.3, 1.4, 1.5, 2., 3., 4., 5., 10.
@@ -108,13 +108,13 @@ struct Object {
         ok();
     }
     // Create an image object.
-    Object(Image&& image, string filename, bool bgr, bool unsaved = true)
+    Object(Image&& image, string filename, bool bgra, bool unsaved = true)
         : _dims(concat(V(1), image.dims())), _is_image(true),
           _video(),
           _nframes_loaded(1), _filename(std::move(filename)), _orig_filename(_filename),
           _frameou1(_dims[0]), _unsaved(unsaved),
           _file_modification_time(get_path_modification_time(_filename)) {
-        _image_is_bgra = bgr;
+        _image_is_bgra = bgra;
         _image_attrib = image.attrib();
         _video = increase_grid_rank(std::move(image));
         // _video[0].assign(image);
@@ -165,6 +165,7 @@ double g_initial_time = 0.;                // requested initial time in video (i
 double g_frametime = k_before_start; // continous time in units of frame; <0. means show first frame next
 std::atomic<int> g_framenum{-1};     // clamp(int(floor(g_frametime)), 0, getob()._nframes_loaded-1) or -1
 Vec2<int> g_frame_dims;              // spatial dimensions in pixels of current video or image object
+bool g_frame_has_transparency;       // true if png image with some partially transparent pixel(s)
 bool g_refresh_texture = false;      // image has changed since uploaded as texture
 struct Message { string s; double time; };
 Array<Message> g_messages;
@@ -259,7 +260,7 @@ struct S_Timeline {
 struct PrefetchImage {
     string filename;
     uint64_t file_modification_time {0}; // 0==load_never_attempted
-    unique_ptr<Image> pimage;            // nullptr could indicate a load error; bgr format iff k_use_bgr
+    unique_ptr<Image> pimage;            // nullptr could indicate a load error; bgra format iff k_use_bgra
 };
 SArray<PrefetchImage,2> g_prefetch_image; // {0==next, 1==prev}
 std::mutex g_mutex_prefetch;
@@ -473,7 +474,7 @@ Object& verify_video() {
 unique_ptr<Object> object_reading_video(string filename) {
     try {
         if (!assertw(file_requires_pipe(filename) || filename_is_video(filename))) SHOW("not video?", filename);
-        bool use_nv12 = k_prefer_nv12;
+        bool use_nv12 = k_prefer_nv12 && !ends_with(filename, ".avi");
         unique_ptr<RVideo> prvideo = make_unique<RVideo>(filename, use_nv12); // may throw
         Vec3<int> dims = prvideo->dims(); // should allocate extra padframes?
         if (use_nv12 && !is_zero(dims.tail<2>()%2)) {
@@ -494,8 +495,8 @@ unique_ptr<Object> object_reading_video(string filename) {
 }
 
 void read_image(Image& image, const string& filename) {
-    if (k_use_bgr) {
-        image.read_file_bgr(filename); // may throw
+    if (k_use_bgra) {
+        image.read_file_bgra(filename); // may throw
     } else {
         image.read_file(filename); // may throw
     }
@@ -506,7 +507,7 @@ unique_ptr<Object> object_reading_image(string filename) {
     Image image;
     HH_CTIMER(_read_image, g_verbose>=1);
     // about 0.20sec for 5472x3648 using WIC; 0.40sec using Image_IO libjpeg; 0.08sec using Pixel::gray
-    bool bgr = false, unsaved = false;
+    bool bgra = false, unsaved = false;
     if (0) {                    // test the response time without any loading delay
         static uchar uc = 40; uc = uchar(40 + my_mod(uc+40, 180)); // not thread-safe
         HH_TIMER(_read_init);
@@ -522,12 +523,12 @@ unique_ptr<Object> object_reading_image(string filename) {
         p.file_modification_time = 0;
         image = std::move(*p.pimage.get());
         p.pimage.reset();
-        bgr = k_use_bgr;
+        bgra = k_use_bgra;
     } else {
         read_image(image, filename); // may throw
-        bgr = k_use_bgr;
+        bgra = k_use_bgra;
     }
-    return make_unique<Object>(std::move(image), std::move(filename), bgr, unsaved);
+    return make_unique<Object>(std::move(image), std::move(filename), bgra, unsaved);
 }
 
 unique_ptr<Object> object_reading_file(string filename) { // may throw
@@ -643,6 +644,8 @@ void set_video_frame(int cob, double frametime, bool force_refresh = false) {
     g_framenum = nframenum;
     o._framenum = g_framenum;
     g_frame_dims = o.spatial_dims();
+    g_frame_has_transparency = 1 && o.is_image() && o._image_attrib.zsize==4 &&
+        find_if(o._video[0], [](const Pixel& pix) { return pix[3]!=255; });
     if (0 && o.is_image()) g_playing = false;
     g_refresh_texture = true;
     if (1 && o.is_image() && !file_requires_pipe(o._filename)) {
@@ -736,6 +739,12 @@ void perform_zoom_at_cursor(float fac_zoom, Vec2<int> yx) {
     set_view(g_view * Frame::translation(-pcenter) * Frame::scaling(thrice(fac_zoom)) * Frame::translation(pcenter));
 }
 
+// Resize the window and reset the view.
+void reset_window(const Vec2<int>& ndims) {
+    hw.resize_window(ndims);
+    g_fit_view_to_window = true;
+}
+
 // Change zooom of window; if fullscreen, zoom about window center, else resize window dimensions.
 void perform_window_zoom(float fac_zoom) {
     g_win_dims = hw.get_window_dims();           // for -key "=="
@@ -751,9 +760,8 @@ void perform_window_zoom(float fac_zoom) {
             if (0) SHOW(zoom, ndims, g_win_dims);
             if (max(ndims, g_win_dims)==g_win_dims) {
                 if (0) SHOW(ndims);
-                hw.resize_window(ndims);
+                reset_window(ndims);
                 set_view(Frame::scaling(thrice(zoom))); // remove translation
-                g_fit_view_to_window = true;
             }
         }
         message("Zoom set to: " + get_szoom());
@@ -777,7 +785,7 @@ void perform_window_zoom(float fac_zoom) {
         // if (ndims[1]>=min_windows7_window_width)
         if (0) SHOW(ndims);
         if (product(ndims)) {
-            hw.resize_window(ndims);
+            reset_window(ndims);
             message("Zooming window");
         }
     }
@@ -897,7 +905,8 @@ bool replace_with_other_object_in_directory(int increment) {
                 Object& ob = getob();
                 Image image = reduce_grid_rank(std::move(ob._video));
                 image.attrib() = ob._image_attrib;
-                if (ob._image_is_bgra ^ k_use_bgr) swap_rgb_bgr(image);
+                if (!ob._image_is_bgra && k_use_bgra) convert_rgba_bgra(image);
+                if (ob._image_is_bgra && !k_use_bgra) convert_bgra_rgba(image);
                 int ii = increment==1 ? 1 : 0;
                 if (g_verbose>=1) SHOW("saving_to_prefetch", ii, ob._filename);
                 std::lock_guard<std::mutex> lg(g_mutex_prefetch);
@@ -967,7 +976,7 @@ void unload_current_object() {
     } else {
         g_cob = -1;
         if (min(g_win_dims, k_default_window_dims)!=k_default_window_dims)
-            hw.resize_window(k_default_window_dims);
+            reset_window(k_default_window_dims);
         hw.redraw_later();
     }
 }
@@ -1077,7 +1086,7 @@ bool DerivedHW::key_press(string skey) {
     bool is_shift =   get_key_modifier(HW::EModifier::shift);
     bool is_control = get_key_modifier(HW::EModifier::control);
     // bool is_alt =     get_key_modifier(HW::EModifier::alt);
-    if (0) SHOW(keycode);
+    if (0) SHOW(skey, keycode, is_shift, is_control);
     if (g_cob>=0 && getob().is_image()) {
         if (skey=="<left>")  skey = "<prior>";
         if (skey=="<right>") skey = "<next>";
@@ -1123,7 +1132,7 @@ bool DerivedHW::key_press(string skey) {
             message("Reloading " + ob.stype() + " " + get_path_tail(filename));
             set_video_frame(g_cob, k_before_start, k_force_refresh);
             ob._filename = filename;
-            if (ob.spatial_dims()!=osdims) resize_window(determine_default_window_dims(g_frame_dims));
+            if (ob.spatial_dims()!=osdims) reset_window(determine_default_window_dims(g_frame_dims));
         } else if (skey=="<f7>") { // move file
             std::lock_guard<std::mutex> lg(g_mutex_obs);
             check_loaded_saved_object();
@@ -1253,6 +1262,11 @@ bool DerivedHW::key_press(string skey) {
             g_dir_media_filenames.invalidate();
         } else if (skey=="<esc>") { // exit, from -key "<esc>" or -hwdelay 2 -hwkey '<enter><esc>'; see also '\033'
             quit();
+        } else if (skey.size()==1 && keycode>='1' && keycode<='9' && is_control) { // C-1 ... C-9: select object
+            int ob = keycode-'1';
+            if (ob<getobnum()) {
+                func_switch_ob(ob);
+            } else beep();
         } else if (skey.size()!=1) {
             recognized = false;
         } else {
@@ -1268,10 +1282,10 @@ bool DerivedHW::key_press(string skey) {
                      if (0 && g_cob>=0) set_video_frame(0, k_before_start);
                      g_looping = k_default_looping;
                      g_mirror_state_forward = true;
-                     set_fullscreen(false); // OK to subsequently call resize_window() below before a draw_window()?
+                     set_fullscreen(false); // OK to subsequently call reset_window() below before a draw_window()?
                      g_speed = 1.;
                      g_fit = k_default_fit;
-                     g_fit_view_to_window = true;
+                     g_fit_view_to_window = true; // also set by reset_window()
                      g_kernel = k_default_kernel;
                      g_show_info = k_default_info;
                      g_other_show_info = false;
@@ -1282,7 +1296,7 @@ bool DerivedHW::key_press(string skey) {
                          ob._framein = 0;
                          ob._frameou1 = ob._dims[0];
                      }
-                     resize_window(determine_default_window_dims(g_frame_dims));
+                     reset_window(determine_default_window_dims(g_frame_dims));
                      message("All parameters reset to defaults", 5.);
                  }
              }
@@ -1417,10 +1431,9 @@ bool DerivedHW::key_press(string skey) {
                      else
                          message("Zoom set to 100%; press <f> to see entire frame", 5.);
                  } else {
-                     g_fit_view_to_window = true;
                      Vec2<int> owin_dims = g_win_dims;
                      Vec2<int> win_dims = determine_default_window_dims(dims);
-                     resize_window(win_dims); // (does not immediately update g_win_dims)
+                     reset_window(win_dims); // (does not immediately update g_win_dims)
                      if (win_dims==dims) {
                          message("Zoom set to 100%");
                      } else if (win_dims!=owin_dims) {
@@ -1432,10 +1445,10 @@ bool DerivedHW::key_press(string skey) {
                      }
                  }
              }
-             bcase '=': ocase '+': { // increase window zoom
+             bcase '=': ocase '+': { // increase window size or zoom
                  perform_window_zoom(k_key_zoom_fac);
              }
-             bcase '-': {       // decrease window zoom
+             bcase '-': {       // decrease window size or zoom
                  perform_window_zoom(1.f/k_key_zoom_fac);
              }
              bcase '\r': {      // <enter>/<ret>/C-M key (== uchar(13) == 'M'-64),  toggle fullscreen
@@ -1475,7 +1488,7 @@ bool DerivedHW::key_press(string skey) {
                  }
                  if (first_cob_loaded>=0) {
                      set_video_frame(first_cob_loaded, k_before_start);
-                     resize_window(determine_default_window_dims(g_frame_dims));
+                     reset_window(determine_default_window_dims(g_frame_dims));
                  }
                  if (smess!="") throw smess;
              }
@@ -1501,7 +1514,7 @@ bool DerivedHW::key_press(string skey) {
                          Image image = reduce_grid_rank(std::move(ob._video));
                          image.attrib() = ob._image_attrib;
                          if (ob._image_is_bgra) {
-                             image.write_file_bgr(filename);
+                             image.write_file_bgra(filename);
                          } else {
                              image.write_file(filename);
                          }
@@ -1591,7 +1604,7 @@ bool DerivedHW::key_press(string skey) {
                                                     append_to_filename(ob._filename, "_resampled")));
                      g_fit_view_to_window = true;
                      message("Resampled " + ob.stype());
-                     // if (nsdims!=osdims) resize_window(determine_default_window_dims(g_frame_dims));
+                     // if (nsdims!=osdims) reset_window(determine_default_window_dims(g_frame_dims));
                  } else {       // no rotation, so crop without resampling
                      Vec2<int> yxL, yxU; fully_visible_image_rectangle(yxL, yxU);
                      if (!ob.is_image()) {
@@ -1649,7 +1662,7 @@ bool DerivedHW::key_press(string skey) {
                      float fac = Args::parse_float(s);
                      ndims = convert<int>(convert<float>(g_frame_dims)*twice(fac));
                  }
-                 if (!ob.is_image()) {
+                 if (!ob.is_image() && ob._video.attrib().suffix!="avi") {
                      ndims = (ndims+2)/4*4; // video should have dims that are multiples of 4
                  } else {
                      if (0) ndims = (ndims+1)/2*2; // no need to round images to even sizes
@@ -1666,8 +1679,7 @@ bool DerivedHW::key_press(string skey) {
                  }
                  add_object(make_unique<Object>(ob, std::move(nvideo), std::move(nvideo_nv12),
                                                 append_to_filename(ob._filename, "_scaled")));
-                 g_fit_view_to_window = true;
-                 resize_window(determine_default_window_dims(g_frame_dims));
+                 reset_window(determine_default_window_dims(g_frame_dims));
                  message("Rescaled " + ob.stype());
              }
              bcase 'A': {       // select window aspect ratio
@@ -1686,17 +1698,20 @@ bool DerivedHW::key_press(string skey) {
                  Vec2<int> ndims = determine_default_window_dims(V(nlarge, int(nlarge*ratio+.5f)));
                  resize_window(ndims);
                  g_fit_view_to_window = false;
-                 Vec2<float> arzoom = convert<float>(ndims) / convert<float>(g_frame_dims);
-                 Frame view = Frame::scaling(V(arzoom[0], arzoom[1], 1.f));
-                 int cmax = arzoom[0]>arzoom[1] ? 0 : 1;
-                 view[1-cmax][1-cmax] = arzoom[cmax];
-                 view[3][1-cmax] = (ndims[1-cmax]-g_frame_dims[1-cmax]*arzoom[cmax])/2.f;
+                 Frame view; {
+                     Vec2<float> arzoom = convert<float>(ndims) / convert<float>(g_frame_dims);
+                     const int cmax = arzoom[0]>arzoom[1] ? 0 : 1;
+                     view = Frame::scaling(concat(twice(arzoom[cmax]), V(1.f)));
+                     view[3][1-cmax] = (ndims[1-cmax]-g_frame_dims[1-cmax]*arzoom[cmax])/2.f;
+                     // align window edge with pixel edge using fmod()
+                     view[3][1-cmax] = view[3][1-cmax] - fmod(view[3][1-cmax], arzoom[cmax]);
+                 }
                  set_view(view);
                  g_prev_win_dims = ndims; // do not look to translate image
              }
              bcase 'L'-64: ocase 'R'-64: { // C-S-l, C-S-r: rotate content 90-degrees left (ccw) or right (clw)
                  std::lock_guard<std::mutex> lg(g_mutex_obs);
-                 int rot_degrees = keycode=='L'-64 ? 90 : -90;
+                 const int rot_degrees = keycode=='L'-64 ? 90 : -90;
                  Object& ob = check_loaded_object();
                  if (ob._video.size()) { // includes the case of ob.is_image()
                      ob._video = rotate_ccw(ob._video, rot_degrees);
@@ -1715,8 +1730,8 @@ bool DerivedHW::key_press(string skey) {
                      ob._unsaved = cur!=2 || !file_exists(ob._filename);
                  }
                  if (!g_fullscreen) {
-                     resize_window(determine_default_window_dims(ob.spatial_dims()));
-                     // if (g_fit_view_to_window) resize_window(g_win_dims.rev());
+                     reset_window(determine_default_window_dims(ob.spatial_dims()));
+                     // if (g_fit_view_to_window) reset_window(g_win_dims.rev());
                  }
                  g_fit_view_to_window = true;
                  set_video_frame(g_cob, g_framenum, k_force_refresh);
@@ -1737,7 +1752,7 @@ bool DerivedHW::key_press(string skey) {
                  Video video(n, ob.spatial_dims());
                  parallel_for_int(f, n) {
                      video[f].assign(g_obs[ibeg+f]->_video[0]);
-                     if (g_obs[ibeg+f]->_image_is_bgra) swap_rgb_bgr(video[f]);
+                     if (g_obs[ibeg+f]->_image_is_bgra) convert_bgra_rgba(video[f]);
                  }
                  VideoNv12 video_nv12;
                  const bool use_nv12 = k_prefer_nv12 && is_zero(video.spatial_dims()%2);
@@ -1773,7 +1788,7 @@ bool DerivedHW::key_press(string skey) {
                  std::atomic<bool> ok{true};
                  parallel_for_int(f, nframes) {
                      if (!ok) continue;
-                     Image image; image.read_file(filenames[f]); // not bgr
+                     Image image; image.read_file(filenames[f]); // not bgra
                      if (image.dims()!=dims.tail<2>()) { ok = false; continue; }
                      if (!use_nv12) {
                          nvideo[f].assign(image);
@@ -1876,7 +1891,6 @@ bool DerivedHW::key_press(string skey) {
                  const Object& ob = check_loaded_video();
                  const int nf = ob.nframes();
                  if (g_framenum<1) throw string("splitting requires selecting frame number >=1");
-                 if (g_framenum==nf) throw string("cannot split at last frame");
                  Video nvideo1, nvideo2;
                  VideoNv12 nvideo1_nv12, nvideo2_nv12;
                  if (ob._video.size()) {
@@ -2021,10 +2035,10 @@ bool DerivedHW::key_press(string skey) {
                      const float saturation_fac = get_saturation_fac();
                      if (ob._video.size()) {
                          nvideo.init(ob._video.dims());
-                         const bool bgr = ob.is_image() && ob._image_is_bgra;
+                         const bool bgra = ob.is_image() && ob._image_is_bgra;
                          parallel_for_size_t(i, ob._video.size()) {
                              Pixel pix = ob._video.raster(i);
-                             if (bgr) std::swap(pix[0], pix[2]);
+                             if (bgra) std::swap(pix[0], pix[2]);
                              Pixel yuv = RGB_to_YUV_Pixel(pix[0], pix[1], pix[2]);
                              float y = yuv[0]/255.f;
                              y = pow(y, g_gamma);
@@ -2033,7 +2047,7 @@ bool DerivedHW::key_press(string skey) {
                              yuv[0] = clamp_to_uchar(int(y*255.f+.5f));
                              for_intL(c, 1, 3) { yuv[c] = clamp_to_uchar(int(128.5f+(yuv[c]-128.f)*saturation_fac)); }
                              pix = YUV_to_RGB_Pixel(yuv[0], yuv[1], yuv[2]);
-                             if (bgr) std::swap(pix[0], pix[2]);
+                             if (bgra) std::swap(pix[0], pix[2]);
                              nvideo.raster(i) = pix;
                          }
                      } else {
@@ -2111,16 +2125,20 @@ bool DerivedHW::key_press(string skey) {
                  const Object& ob = check_loaded_video();
                  if (g_framenum<0) throw string("no current video frame");
                  Image image(ob.spatial_dims());
-                 bool bgr = true;
+                 bool bgra = false;
                  if (ob._video_nv12.size()) {
                      convert_Nv12_to_Image_BGRA(ob._video_nv12[g_framenum], image);
+                     bgra = true;
                  } else {
                      image = ob._video[g_framenum];
-                     bgr = ob.is_image() && ob._image_is_bgra;
+                     if (ob.is_image()) {
+                         bgra = ob._image_is_bgra;
+                         image.attrib() = ob._image_attrib;
+                     }
                  }
                  string filename = append_to_filename(ob._filename, sform("_frame%d", g_framenum+0));
                  filename = get_path_root(filename) + ".png";
-                 g_obs.push(make_unique<Object>(std::move(image), filename, bgr));
+                 g_obs.push(make_unique<Object>(std::move(image), filename, bgra));
                  message("Saved current frame as new image");
              }
              bcase 'F': {       // set framerate
@@ -2151,6 +2169,34 @@ bool DerivedHW::key_press(string skey) {
                  ob._video.attrib().bitrate = int(bitrate+.5);
                  redraw_later();
              }
+             bcase 'C'-64: {    // C-c: copy image or frame to clipboard
+                 std::lock_guard<std::mutex> lg(g_mutex_obs);
+                 Object& ob = check_object();
+                 if (g_framenum<0) throw string("no current video frame");
+                 Image image(ob.spatial_dims());
+                 bool bgra = false;
+                 if (ob._video_nv12.size()) {
+                     convert_Nv12_to_Image(ob._video_nv12[g_framenum], image);
+                 } else {
+                     image = ob._video[g_framenum];
+                     if (ob.is_image()) {
+                         bgra = ob._image_is_bgra;
+                         image.attrib() = ob._image_attrib;
+                     }
+                 }
+                 if (bgra) convert_bgra_rgba(image);
+                 if (!copy_image_to_clipboard(image)) throw string("could not copy image/frame to clipboard");
+             }
+             bcase 'V'-64: {    // C-v: paste clipboard image as new object
+                 std::lock_guard<std::mutex> lg(g_mutex_obs);
+                 Image image;
+                 if (!copy_clipboard_to_image(image)) throw string("could not copy an image from clipboard");
+                 const bool bgra = false; const bool unsaved = true;
+                 string filename = get_current_directory() + "/v1.png";
+                 g_obs.push(make_unique<Object>(std::move(image), filename, bgra, unsaved));
+                 set_video_frame(getobnum()-1, k_before_start);
+                 reset_window(determine_default_window_dims(g_frame_dims));
+             }
              bcase 'i': {       // info
                  g_show_info = !g_show_info;
                  redraw_later();
@@ -2176,9 +2222,12 @@ bool DerivedHW::key_press(string skey) {
                      if (g_cob>=0) {
                          const Object& ob = getob();
                          SHOW(g_cob, ob._filename);
-                         SHOW(ob._dims, ob._nframes_loaded, ob._framenum, ob._framein, ob._frameou1, ob._unsaved);
+                         SHOW(ob._dims, ob._nframes_loaded, ob._framenum, ob._framein, ob._frameou1);
+                         SHOW(ob._unsaved, ob._file_modification_time);
+                         if (ob.is_image()) SHOW(ob._image_is_bgra, ob._image_attrib.zsize);
                      }
                  }
+                 if (1) g_refresh_texture = true;
                  redraw_later();
              }
              bcase '/': {       // no-op operation, for "-key /"
@@ -2573,10 +2622,12 @@ void upload_image_to_texture() {
                 // frame.assign(getob()._video[g_framenum]);
                 CMatrixView<Pixel> vframe(getob()._video[g_framenum]);
                 std::copy(vframe.begin(), vframe.end(), frame.data());
-                if (!getob().is_image())
+                if (!getob().is_image() || !getob()._image_is_bgra) {
                     frame_format = GL_RGBA;
-                else if (getob()._image_is_bgra && !supports_BGRA)
-                    swap_rgb_bgr(frame);
+                } else if (!supports_BGRA) {
+                    convert_bgra_rgba(frame);
+                    frame_format = GL_RGBA;
+                }
             }
             return frame_format;
         });
@@ -2620,264 +2671,14 @@ static const string glsl_shader_version = "#version 120\n"
 static const string glsl_shader_version = "#version 330\n"; // not supported on cygwin
 #endif
 
-static const string vertex_shader = glsl_shader_version + (1+R"(
-#if !defined(MAKEFILE_DEP)
-#if defined(__cplusplus)
-#error We are not inside C++ string
-#endif
-in vec4 vertex;                 // (p.xy, uv.st), called 'attribute' in #version 130
-out vec2 frag_uv;               // called 'varying' in #version 130
-
-void main() {
-    // gl_TexCoord[0] = gl_MultiTexCoord0;
-    gl_Position = vec4(vertex.xy, 0.f, 1.f);
-    frag_uv = vertex.zw;
-    if (false) {
-        float s = 1.f;
-        gl_Position = vec4((gl_VertexID==0 ? vec2(-s, -s) : gl_VertexID==1 ? vec2(+s, -s) :
-                            gl_VertexID==2 ? vec2(+s, +s) : gl_VertexID==3 ? vec2(-s, +s) :
-                            vertex.xy), 0, 1);
-        frag_uv = (gl_Position.xy+1.f)/2.f;
-        frag_uv.y = 1.f-frag_uv.y; // flip Y
-    }
-}
-#endif // !defined(MAKEFILE_DEP)
-)");
+static const string vertex_shader = glsl_shader_version + (
+    #include "vertex_shader.glsl"
+    );
 
 
-// See http://www.codeproject.com/Articles/236394/Bi-Cubic-and-Bi-Linear-Interpolation-with-GLSL
-// See ~/prevproj/2014/filtering/viewer/render.fx
-static const string fragment_shader = glsl_shader_version + (1+R"(
-#if !defined(MAKEFILE_DEP)
-precision highp float; // http://stackoverflow.com/questions/5366416/ and
-precision highp int;   // https://github.com/processing/processing/issues/1073 (#if defined(GL_ES))
-
-uniform sampler2D tex;
-uniform int kernel_id;
-uniform float brightness_term;
-uniform float contrast_fac;
-uniform float gamma;
-uniform float saturation_fac;
-
-in vec2 frag_uv;                // called 'varying' in #version 130
-out vec4 frag_color;            // implicitly 'gl_FragColor' in #version 130
-
-float len2(vec2 v) { return dot(v, v); }
-
-vec4 lerp(vec4 v1, vec4 v2, float f) { return (1.f-f)*v1+f*v2; }
-
-// http://stackoverflow.com/questions/24388346/how-to-access-automatic-mipmap-level-in-glsl-fragment-shader-texture
-float miplod(vec2 p) {
-#if __VERSION__>=400
-    return textureQueryLod(tex, p).x; // requires OpenGL 4.00
-#endif
-// On Intel HD 4000 10.18.10.4276 driver, this use of "#extension" causes shader program validation crash.
-#if defined(GL_ARB_texture_query_lod) && 0
-#extension GL_ARB_texture_query_lod : require
-    return textureQueryLOD(tex, p).x; // extension; note different capitalization than OpenGL 4.00 feature
-#endif
-    if (true) {
-        ivec2 texdim = textureSize(tex, 0);
-        vec2 ftexdim = vec2(texdim);
-        float v2 = max(len2(dFdx(p*ftexdim)), len2(dFdy(p*ftexdim)));
-        return log2(v2)*0.5f;
-    }
-    return 0.f;
-}
-
-// blinear has support [-1, +1]
-// blinear[x_] := With[{r = Abs[x]}, If[r < 1, 1-r, 0]]
-float blinear(float x) {
-    float r = abs(x);
-    return (r<1.0f ? 1.0f-r : 0.0f);
-}
-
-// keys has support [-2, +2]
-// keys[x_] := With[{r = Abs[x]}, 1/2 If[r < 1, 2 + r r (-5 + 3 r), If[r < 2, 4 + r (-8 + (5 - r) r), 0]]]
-float keys(float x) {
-    float r = abs(x);
-    return 0.5f * ( r<1.0f ? 2.0f+r*r*(-5.0f+3.0f*r) :
-                    r<2.0f ? 4.0f+r*(-8.0f+(5.0f-r)*r) : 0.0f );
-}
-
-// mitchell has support [-2, +2]
-// mitchell[x_] := With[{r  = Abs[x]}, 1/18 If[r < 1, 16 + r r (-36 + 21 r),
-//   If[r < 2, 32 + r (-60 + (36 - 7 r) r), 0]]];  (* mitchell[x, 1/3, 1/3] *)
-float mitchell(float x) {
-    float r = abs(x);
-    return (1.0f/18.0f) * (r<1.0f ? 16.0f+r*r*(-36.0f+21.0f*r) :
-                           r<2.0f ? 32.0f+r*(-60.0f+(36.0f-7.0f*r)*r) : 0.0f);
-}
-
-// bspline3 has support [-2, +2]
-// bspline3[x_] := With[{r = Abs[x]}, If[r < 1, 2/3 + (-1 + r/2) r^2, If[r <= 2, 4/3 + r (-2 + (1 - r/6) r), 0]]]
-float bspline3(float x) {
-    float r = abs(x);
-    return (r<1.0f ? 2.0f/3.0f+r*r*(-1.0f+r*0.5f) :
-            r<2.0f ? 4.0f/3.0f+r*(-2.0f+r*(1.0f-r/6.0f)) : 0.0f);
-}
-
-// omoms3 has support [-2, +2]
-// omoms3[x_] := With[{r = Abs[x]}, 1/42 If[r < 1, 26 + r (3 + r (-42 + 21 r)),
-//                      If[r < 2, 58 + r (-85 + (42 - 7 r) r), 0]]]
-float omoms3(float x) {
-    float r = abs(x);
-    return 1.0f/42.0f*(r<1.0f ? 26.0f+r*(3.0f+r*(-42.0f+r*21.0f)) :
-                       r<2.0f ? 58.0f+r*(-85.0f+r*(42.0f+r*-7.0f)) : 0.0f);
-}
-
-const float TAU = 6.2831853071795864769f; // N[2 Pi, 20] ;  see http://tauday.com/
-
-float sinc_abs(float x) {
-    // Sinc[x]  where here I assume that x>=0
-    // ASSERTX(x>=0.);
-    return x<1e-9f ? 1.f : sin(x)/x;
-}
-
-// lanczos[x_, r_] has support [-r, +r]
-// dirichlet[x_, a_] := If[x < -a/2, 0, If[x < a/2, Sinc[Pi x], 0]] // a==W==2*r
-// Sinc[x] = Sin[x]/x for x!=0, but is 1 for x=0.
-// lanczos[x_, a_] := dirichlet[x, a] Sinc[2 Pi x/a]
-// lanczos[x_, r_] := dirichlet[x, 2*r] Sinc[2 Pi x/(2*r)]
-float lanczos(float x, float r) {
-    x = abs(x);
-    return x<r ? sinc_abs((TAU/2.f)*x) * sinc_abs(((TAU/2.f)/r)*x) : 0.f;
-}
-
-// lanczos6 has support [-3, +3]
-float lanczos6(float x) { return lanczos(x, 3.f); }
-
-// lanczos10 has support [-5, +5]
-float lanczos10(float x) { return lanczos(x, 5.f); }
-
-float eval_basis(float x, int basis_id) {
-    if (false) { }
-    else if (basis_id==1) { return keys(x); }
-    else if (basis_id==2) { return lanczos6(x); }
-    else if (basis_id==3) { return lanczos10(x); }
-    else { return -1.f; }
-}
-
-vec4 eval_general(vec2 p, int basis_id, sampler2D ptexture, vec2 range) {
-    float l = miplod(p);
-    bool is_magnification = l<0.001f;
-    // Because I do not manually construct good minified levels, do not use expensive lanczos kernels when minifying.
-    if (!is_magnification && basis_id>=2) basis_id = 1;
-    // basis support: keys [-2, +2], lanczos6 [-3, +3], lanczos10 [-5, +5]
-    int r = basis_id==1 ? 2 : basis_id==2 ? 3 : basis_id==3 ? 5 : -1;
-    ivec2 tdim = textureSize(tex, 0);
-    vec2 lidim = vec2(tdim);
-    vec4 color;
-    if (is_magnification) {
-        l = 0.f;
-        vec4 tcolor = vec4(0.f, 0.f, 0.f, 0.f);
-        float tw = 0.f;
-        if (true) {
-            vec2 ps = p*lidim-0.5f; // scaled and offset by 1/2 cell to account for dual sampling of texels
-            vec2 pfr = fract(ps); vec2 pfl = ps-pfr;
-            vec2 pbase = 1.f-pfr-float(r);
-            for (int x = 0; x<2*r; x++) for (int y = 0; y<2*r; y++) {
-                float w = eval_basis(pbase[0]+float(x), basis_id) * eval_basis(pbase[1]+float(y), basis_id);
-                // tcolor += texture(ptexture, (pfl-float(r)+1.5f+vec2(float(x), float(y)))/lidim) * w;
-                tcolor += textureLod(ptexture, (pfl-float(r)+1.5f+vec2(float(x), float(y)))/lidim, 0.f) * w;
-                tw += w;
-            }
-        } else {
-            vec2 ps = p*lidim-0.5f; // scaled and offset by 1/2 cell to account for dual sampling of texels
-            vec2 pfr = fract(ps); ivec2 pfl = ivec2(floor(ps));
-            vec2 pbase = 1.f-pfr-float(r);
-            ivec2 pbase2 = pfl-r+1;
-            for (int x = 0; x<2*r; x++) for (int y = 0; y<2*r; y++) {
-                float w = eval_basis(pbase[0]+float(x), basis_id) * eval_basis(pbase[1]+float(y), basis_id);
-                // Note: correctly matches GL_CLAMP / GL_CLAMP_TO_EDGE (Bndrule::clamped)
-                tcolor += texelFetch(ptexture, clamp(pbase2+ivec2(x, y), ivec2(0), ivec2(lidim)-1), 0) * w;
-                tw += w;
-            }
-        }
-        if (basis_id>=2) tcolor /= tw; // lanczos6 and lanczos10 need renormalization
-        color = tcolor;
-    } else {                    // minification
-        float lfr = fract(l); float lfl = l-lfr;
-        vec4 t0color = vec4(0.f);
-        {
-            vec2 dim = true ? vec2(textureSize(tex, int(lfl))) : lidim/pow(2.f, lfl+0.f);
-            vec2 ps = p*dim-0.5f;
-            vec2 pfr = fract(ps); vec2 pfl = ps-pfr;
-            vec2 pbase = 1.f-pfr-float(r);
-            float tw = 0.f;
-            for (int x = 0; x<2*r; x++) for (int y = 0; y<2*r; y++) {
-                float w = eval_basis(pbase[0]+float(x), basis_id) * eval_basis(pbase[1]+float(y), basis_id);
-                t0color += textureLod(ptexture, (pfl-float(r)+1.5f+vec2(float(x), float(y)))/dim, lfl+0.f) * w;
-                tw += w;
-            }
-            if (basis_id>=2) t0color /= tw; // lanczos6 and lanczos10 need renormalization
-        }
-        vec4 t1color = vec4(0.f);
-        {
-            vec2 dim = true ? vec2(textureSize(tex, int(lfl)+1)) : lidim/pow(2.f, lfl+1.f);
-            vec2 ps = p*dim-0.5f;
-            vec2 pfr = fract(ps); vec2 pfl = ps-pfr;
-            vec2 pbase = 1.f-pfr-float(r);
-            float tw = 0.f;
-            for (int x = 0; x<2*r; x++) for (int y = 0; y<2*r; y++) {
-                float w = eval_basis(pbase[0]+float(x), basis_id) * eval_basis(pbase[1]+float(y), basis_id);
-                t1color += textureLod(ptexture, (pfl-float(r)+1.5f+vec2(float(x), float(y)))/dim, lfl+1.f) * w;
-                tw += w;
-            }
-            if (basis_id>=2) t1color /= tw; // lanczos6 and lanczos10 need renormalization
-        }
-        color = lerp(t0color, t1color, lfr);
-    }
-    color = color*(range[1]-range[0])+range[0];
-    return color;
-}
-
-vec4 RGB_to_YUV(vec4 rgb) {
-    return vec4(rgb[0]*(vec3(66.f,  -38.f, 112.f)/256.f)+
-                rgb[1]*(vec3(129.f, -74.f, -94.f)/256.f)+
-                rgb[2]*(vec3(25.f,  112.f, -18.f)/256.f)+
-                (vec3(16.f, 128.f, 128.f)/256.f),
-                rgb[3]);
-}
-
-vec4 YUV_to_RGB(vec4 yuv) {
-    return vec4(yuv[0]*(vec3(298.f,  298.f, 298.f)/256.f)+
-                yuv[1]*(vec3(0.f,   -100.f, 516.f)/256.f)+
-                yuv[2]*(vec3(409.f, -208.f,   0.f)/256.f)+
-                (vec3(-298.f*16.f-409.f*128.f, -298.f*16.f+100.f*128.f+208.f*128.f, -298.f*16.f-516.f*128.f)/65536.f),
-                yuv[3]);
-}
-
-void main() {
-    // gl_FragColor = vec4(gl_TexCoord[0].st, 0.f, 1.f); return;
-    vec4 color;
-    if (kernel_id==0 || kernel_id==4) { // linear, nearest
-        color = texture(tex, frag_uv);
-    } else {
-        vec2 range = vec2(0.0f, 1.0f);
-        color = eval_general(frag_uv, kernel_id, tex, range);
-    }
-    bool over_background_color = true;
-    vec4 background_color = vec4(255.f, 150.f, 150.f, 255.f)/255.f; // pink
-    if (over_background_color) {
-        color = color + (1.f-color.a)*background_color;
-    }
-    if (false) color = vec4(1.f, 1.f, 0.f, 1.f); // yellow
-    if (brightness_term!=0.f || contrast_fac!=1.f || gamma!=1.f || saturation_fac!=1.f) {
-        // http://www.poynton.com/notes/brightness_and_contrast/
-        vec4 yuv = RGB_to_YUV(color);
-        float y = yuv[0];
-        y = pow(y, gamma);
-        y *= contrast_fac;
-        y += brightness_term;
-        yuv[0] = y;
-        for (int c = 1; c<3; c++) yuv[c] = .5f+(yuv[c]-.5f)*saturation_fac;
-        color = YUV_to_RGB(yuv);
-    }
-    frag_color = color;
-}
-#endif // !defined(MAKEFILE_DEP)
-)");
+static const string fragment_shader = glsl_shader_version + (
+#include "fragment_shader.glsl"
+    );
 
 
 void render_image() {
@@ -2947,16 +2748,18 @@ void render_image() {
         USE_GL_EXT(glUniform4fv, PFNGLUNIFORM4FVPROC);
         USE_GL_EXT(glUniform1i, PFNGLUNIFORM1IPROC);
         USE_GL_EXT(glUniform1f, PFNGLUNIFORM1FPROC);
+        USE_GL_EXT(glUniform2fv, PFNGLUNIFORM2FVPROC);
         static GLuint vertex_shader_id;
         static GLuint fragment_shader_id;
         static GLuint program_id;
         static int h_vertex;
+        static int h_tex;
         static int h_kernel_id;
         static int h_brightness_term;
         static int h_contrast_fac;
         static int h_gamma;
         static int h_saturation_fac;
-        static int h_tex;
+        static int h_checker_offset;
         static GLuint buf_p;
         static GLuint buf_i;
         static bool is_init = false;
@@ -3021,12 +2824,13 @@ void render_image() {
                 assertx(glIsProgram(program_id));
             }
             h_vertex = glGetAttribLocation(program_id, "vertex"); assertx(h_vertex>=0);
+            h_tex = glGetUniformLocation(program_id, "tex"); assertx(h_tex>=0);
             h_kernel_id = glGetUniformLocation(program_id, "kernel_id"); assertx(h_kernel_id>=0);
             h_brightness_term = glGetUniformLocation(program_id, "brightness_term"); assertx(h_brightness_term>=0);
             h_contrast_fac = glGetUniformLocation(program_id, "contrast_fac"); assertx(h_contrast_fac>=0);
             h_gamma = glGetUniformLocation(program_id, "gamma"); assertx(h_gamma>=0);
             h_saturation_fac = glGetUniformLocation(program_id, "saturation_fac"); assertx(h_saturation_fac>=0);
-            h_tex = glGetUniformLocation(program_id, "tex"); assertx(h_tex>=0);
+            h_checker_offset = glGetUniformLocation(program_id, "checker_offset"); assertx(h_checker_offset>=0);
             glGenBuffers(1, &buf_p);
             glGenBuffers(1, &buf_i);
             assertx(!gl_report_errors());
@@ -3040,6 +2844,14 @@ void render_image() {
             glUniform1f(h_contrast_fac, get_contrast_fac());
             glUniform1f(h_gamma, g_gamma);
             glUniform1f(h_saturation_fac, get_saturation_fac());
+            {
+                static int s_frame_num = 0;
+                s_frame_num++;
+                const float motion_radius = 5.f;
+                const double angular_velocity = .1;
+                const float ang = float(my_mod(double(s_frame_num)*angular_velocity, D_TAU));
+                glUniform2fv(h_checker_offset, 1, (motion_radius*V(cos(ang), sin(ang))).data());
+            }
             if (0) {
                 int h_somematrix = glGetUniformLocation(program_id, "somematrix");
                 glUniformMatrix4fv(h_somematrix, 1, GL_FALSE, SGrid<float, 4, 4>{}.data());
@@ -3437,8 +3249,8 @@ void DerivedHW::draw_window(const Vec2<int>& dims) {
             "Keys:  <r>eset_all",
             " <=>enlarge   <->shrink   <0>100%   <enter>fullscreen   <f>it_stretch   <w>indow_fit   <A>spectratio",
             " <k>ernel_filter   <b>rightness_controls",
-            " <n>ext_object   <p>rev   <P>first   <N>last   <c>lone   <x>exchange_prev   <X>exchange_next",
-            " <C-d>unload_object   <C-k>eep_only_cur",
+            " <n>ext_object   <p>rev   <C-1>,<P>first   <N>last   <c>lone   <x>exchange_prev   <X>exchange_next",
+            " <C-d>unload_object   <C-k>eep_only_cur   <C-c>copy   <C-v>paste",
             " <pgdn>next_file   <pgup>prev_file   <s>ort_order   <C-o>pen   <C-s>ave   <C-S-s>overwrite",
             " <f2>rename   <f5>reload   <f7>move   <f8>copy   <C-n>ew_window   <d>irectory",
             " <C>rop_to_view   <S>cale_using_view   <C-S-l>,<C-S-r>rotate   <W>hite_crop",
@@ -3447,8 +3259,8 @@ void DerivedHW::draw_window(const Vec2<int>& dims) {
             " <spc>play/pause   <l>oop   <a>ll_loop   <m>irror_loop",
             " <left>frame-1   <right>frame+1   <home>first   <end>last",
             " <[>slower   <]>faster   <1>normal   <2>twice   <5>half   <F>ramerate   <B>itrate",
-            " <,>mark_beg   <.>mark_end   <u>nmark   <T>rim   <C-S-t>cut   <|>split",
-            " <&>merge   <M>irror   <R>esample_temporally   <g>en_seamless_loop   <C-g>high-quality   <L>oop",
+            " <,>mark_beg   <.>mark_end   <u>nmark   <T>rim   <C-S-t>cut   <|>split    <&>merge   <M>irror",
+            " <R>esample_temporally   <g>en_seamless_loop   <C-g>high-quality_loop   <L>oop",
             " <I>mage_from_frame   <V>ideo_from_images   <#>from_image_files%03d",
         };
         for_int(i, ar.num())
@@ -3535,6 +3347,7 @@ void DerivedHW::draw_window(const Vec2<int>& dims) {
 #endif
     }
     assertx(!gl_report_errors());
+    if (g_frame_has_transparency) redraw_later();
 }
 
 // For video (either Video or VideoNv12) in object ob, with specified trim frames, compute looping parameters
@@ -3803,8 +3616,8 @@ void background_work(bool asynchronous) {
                         if (is_masked) pix = Pixel::white();
                         image_vlp[yx] = pix;
                     });
-                    const bool bgr = false;
-                    g_vlp_ready_obj = make_unique<Object>(std::move(image_vlp), std::move(filename), bgr);
+                    const bool bgra = false;
+                    g_vlp_ready_obj = make_unique<Object>(std::move(image_vlp), std::move(filename), bgra);
                 }
                 {
                     string filename = append_to_filename(getob()._filename, "_loop");
@@ -3928,7 +3741,11 @@ void do_vlp(Args& args) {
 
 static void crop_spatial_dimensions_to_multiple(VideoNv12& onv12, int k) {
     assertx(k%2==0);            // should be a multiple of 2 for UV representation
-    Vec2<int> odims = onv12.get_Y().dims().tail<2>();
+    // Workaround for Cygwin gcc 5.4.0 compiler bug in demos/create_videoloop_palmtrees.sh:
+    //  (cd ~/src/demos; ~/src/bin/cygwin/VideoViewer -batch_create_loop data/palmtrees_small.mp4 v.mp4)
+    // Vec2<int> odims = onv12.get_Y().dims().tail<2>();
+    Vec3<int> tmpdims = onv12.get_Y().dims();
+    Vec2<int> odims = tmpdims.tail<2>();
     Vec2<int> ndims = odims/k*k;
     if (ndims==odims) return;
     Warning("Cropping spatial dimensions of video to more even size");
@@ -4056,8 +3873,8 @@ void do_zonal(Args& args) {
     }
     {
         std::lock_guard<std::mutex> lg(g_mutex_obs);
-        const bool bgr = false; const bool unsaved = true;
-        g_obs.push(make_unique<Object>(std::move(image), get_current_directory() + "/zonal_plate.png", bgr, unsaved));
+        const bool bgra = false; const bool unsaved = true;
+        g_obs.push(make_unique<Object>(std::move(image), get_current_directory() + "/zonal_plate.png", bgra, unsaved));
     }
 }
 
@@ -4083,7 +3900,7 @@ void DerivedHW::drag_and_drop(CArrayView<string> filenames) {
         }
         if (nread) set_video_frame(getobnum()-nread, k_before_start);
         if (g_cob>=0 && (1 || g_cob==0)) { // resize window appropriately
-            resize_window(determine_default_window_dims(g_frame_dims));
+            reset_window(determine_default_window_dims(g_frame_dims));
         }
     }
 }
